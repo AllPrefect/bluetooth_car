@@ -110,13 +110,13 @@ bool oledOk = false;       // OLED 在线标志：不在线时跳过全部显示
 enum CarMode { MODE_AUTO,
                MODE_MANUAL };
 enum AutoState {
+  AUTO_VERIFY,     // 停车全幅扫描：确认方向无障碍后才允许前进
   AUTO_FORWARD,
-  AUTO_OBSTACLE_STOP,
-  AUTO_SCAN_LEFT,
-  AUTO_SCAN_RIGHT,
   AUTO_TURN_LEFT,
   AUTO_TURN_RIGHT,
-  AUTO_BACK_UP   // 死胡同：两侧都堵，倒车脱困后重新扫描
+  AUTO_BACK_UP,    // 死胡同：两侧都堵，倒车脱困后重新扫描
+  AUTO_TURN_AROUND, // 连续倒车仍出不去：原地掉头换方向
+  AUTO_FAULT       // 超声波疑似失效（连续多轮全无回波 + 轮子卡住）：停车报警，等按 A 重试
 };
 
 CarMode currentMode = MODE_MANUAL;  // 默认手动待命，电机不启动；发 A 进自动，发 F/B/L/R 手动行驶
@@ -126,15 +126,47 @@ AutoState autoState = AUTO_FORWARD;
 
 const int OBSTACLE_THRESHOLD = 25;   // 正前方刹停距离 cm
 const int APPROACH_DIST = 50;        // 接近减速区：进入该距离提前降速，避免全速怼到跟前急刹
-const int SIDE_CLEAR_MIN = 30;       // 左右至少这么空才算可通行，两侧都不够 = 死胡同
+const int BRAKE_ZONE_DIST = 35;      // 贴身减速区：再降一半，减小撞墙动能
+const int SIDE_CLEAR_MIN = 30;       // 左右至少这么空才算可通行
+const int DEAD_END_SIDE_CM = 50;     // 死胡同判定：正前堵住且两侧都不足 50cm，转向也进不去 → 倒车
 const int TURN_TIME_MS = 800;        // 基准转向时长（对应基准速度 180，实际按速度缩放）
-const int BACKUP_TIME_MS = 600;      // 死胡同倒车时长（同样按速度缩放）
-const int SCAN_TIME_MS = 300;
+const int BACKUP_TIME_MS = 900;      // 死胡同倒车时长（同样按速度缩放，给足脱困距离）
+const int MAX_BACKUP_TIMES = 3;      // 连续倒车 3 次仍出不去就原地掉头
+int backUpCount = 0;                 // 连续倒车次数，前进成功即清零
 const int STALL_TIME_MS = 1200;      // 给油但车轮不转的判定时长（卡住逃逸，需码盘在线）
 
 int frontDistance = 0;
 int leftDistance = 0;
 int rightDistance = 0;
+
+/* 起步前确认扫描（AUTO_VERIFY）：
+   车停稳，舵机匀速连续摆过 -75°~+75°，扫到格点就测一次，全程不停顿；
+   扫描用短超时测距(量程 120cm，阻塞约 7.6ms)，舵机转速不被打断，观感是顺滑的匀速摆动。
+   扫完整幅再决策：正前 ±30° 最近距离 >= 30cm 才允许前进，否则按左右结果转向/倒车。 */
+const int8_t SWEEP_MAX_DEG = 75;             // 扫描半幅（留余量不顶 0/180 机械限位）
+const int8_t SWEEP_STEP_DEG = 15;            // 采样格点
+const int SWEEP_POINTS = 2 * SWEEP_MAX_DEG / SWEEP_STEP_DEG + 1;
+const int SWEEP_CENTER_IDX = SWEEP_MAX_DEG / SWEEP_STEP_DEG;
+const unsigned long MICRO_STEP_MS = 5;         // 匀速扫描：每 5ms 走 1°（≈200°/s）
+const unsigned long FORWARD_SONAR_MS = 60;     // 行驶中正前测距间隔
+const unsigned long FORWARD_MIN_MS = 600;      // 每次确认后最短前进时长
+const int CONFIRM_CLEAR_CM = 30;               // 正前确认阈值：该距离以上才允许前进
+int8_t scanOffset = 0;        // 当前波束角度（相对中位，正=左），供显示
+int8_t scanPos = 0;           // 摆动位置（同时就是写入舵机的角度）
+int8_t scanDir = -1;          // 摆动方向 -1=向右 +1=向左
+bool scanReturning = false;   // 扫到左端后匀速回到中位再交棒，避免最后一步甩 75°
+int8_t scanLastIdx = -99;     // 上次采样的格点，避免同一格重复 ping
+int8_t lastServoOffset = -128;// 上次写入的舵机角度，相同值不再重复写
+unsigned long scanTickMs = 0;
+int scanFrontMin = 0;         // 本次扫描 正前±30° 内最近距离（车头通路，用于放行判定）
+int scanCenterMin = 0;        // 本次扫描 正中读数（用于决定本段能走多远）
+int scanLeftMin = 0;          // 本次扫描 左半区最近距离
+int scanRightMin = 0;         // 本次扫描 右半区最近距离
+int sweepMap[SWEEP_POINTS];   // 本次扫描角度图：idx 0=最右 … 正中 … 最大=最左
+uint8_t noEchoScans = 0;      // 连续多少轮扫描整幅都无回波（全 999）：多轮全空 + 卡住 = 传感器失效
+unsigned long forwardDeadlineMs = 0;  // 本段前进的截止时刻（到点停车重扫）
+
+
 
 int currentSpeed = 180;
 const int SPEED_STEP = 20;
@@ -162,6 +194,7 @@ unsigned long lastSonarMs = 0;
 unsigned long lastOledMs = 0;
 unsigned long lastEncCalcMs = 0;
 unsigned long stateStartMs = 0;
+unsigned long stallStartMs = 0;   // 卡住检测起点（进 FORWARD 时重置，避免沿用扫描期间的时间戳）
 
 const unsigned long SONAR_INTERVAL = 100;
 const unsigned long OLED_INTERVAL = 200;
@@ -197,6 +230,18 @@ void carBackward(int speed) {
   analogWrite(RIGHT_ENB, speed);
 }
 
+// 前进中差速绕行：veerRight=true 右轮减速向右绕；慢侧不低于死区，避免变原地转
+void carForwardVeer(int spd, bool veerRight) {
+  int slow = spd / 2;
+  if (slow < MIN_RUN_PWM) slow = MIN_RUN_PWM;
+  digitalWrite(LEFT_IN1, LOW);
+  digitalWrite(LEFT_IN2, HIGH);
+  digitalWrite(RIGHT_IN3, LOW);
+  digitalWrite(RIGHT_IN4, HIGH);
+  analogWrite(LEFT_ENA, veerRight ? spd : slow);
+  analogWrite(RIGHT_ENB, veerRight ? slow : spd);
+}
+
 // 实测整车转向与指令相反，左右转实现已对调（自动避障转向也走这里）
 void carTurnLeft(int speed) {
   digitalWrite(LEFT_IN1, HIGH);
@@ -228,8 +273,13 @@ void updateLed() {
     return;
   }
 
-  if (autoState == AUTO_OBSTACLE_STOP || autoState == AUTO_SCAN_LEFT ||
-      autoState == AUTO_SCAN_RIGHT || autoState == AUTO_BACK_UP) {
+  if (autoState == AUTO_FAULT) {  // 传感器失效报警：快闪
+    if (millis() - lastBlinkMs > 60) {
+      ledOn = !ledOn;
+      digitalWrite(STATUS_LED, ledOn);
+      lastBlinkMs = millis();
+    }
+  } else if (autoState == AUTO_VERIFY || autoState == AUTO_BACK_UP || autoState == AUTO_TURN_AROUND) {
     if (millis() - lastBlinkMs > 100) {
       ledOn = !ledOn;
       digitalWrite(STATUS_LED, ledOn);
@@ -244,12 +294,14 @@ void updateLed() {
 
 void servoCenter() {
   scanServo.write(SERVO_CENTER);
+  lastServoOffset = 0;
 }
-void servoLeft() {
-  scanServo.write(SERVO_LEFT);
-}
-void servoRight() {
-  scanServo.write(SERVO_RIGHT);
+
+// 只在角度变化时写舵机：Servo.write 内部有 map/除法，每拍重复写没有意义
+void writeScanServo(int8_t offset) {
+  if (offset == lastServoOffset) return;
+  lastServoOffset = offset;
+  scanServo.write(constrain(SERVO_CENTER + offset, 5, 175));  // 钳制在物理行程内
 }
 
 /* ==================== 超声波测一次 ==================== */
@@ -265,6 +317,33 @@ int readSonarCm() {
   // 避障用 < 阈值比较，999 永远不会误触发
   unsigned long us = pulseIn(SONAR_ECHO, HIGH, SONAR_MAX_CM * 58UL + 2000UL);
   return (us == 0) ? 999 : (int)(us / 58);
+}
+
+// 扫描专用快速测距：量程 120cm，pulseIn 超时约 7.6ms，阻塞远小于一步 5ms 的推进节拍，
+// 匀速摆动不被打断；120cm 外一律 999（等同"空旷"）。
+// 量程不能太小：60cm 时把 60~100cm 外的侧墙误判成空旷，会转过去再撞墙
+int readSonarCmFast() {
+  digitalWrite(SONAR_TRIG, LOW);
+  delayMicroseconds(4);
+  digitalWrite(SONAR_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(SONAR_TRIG, LOW);
+  unsigned long us = pulseIn(SONAR_ECHO, HIGH, 120 * 58UL + 600UL);
+  return (us == 0) ? 999 : (int)(us / 58);
+}
+
+// 测 3 次取中值：斜面/软障碍回波弱时单次 ping 易返回 999（被当成空旷），
+// 单样本会直接打穿 25cm 刹停线；中值滤波后需 2/3 次都无回波才误判，概率大幅下降
+int readSonarFiltered() {
+  int a = readSonarCmFast();
+  delay(5);
+  int b = readSonarCmFast();
+  delay(5);
+  int c = readSonarCmFast();
+  if (a > b) { int t = a; a = b; b = t; }
+  if (b > c) { int t = b; b = c; c = t; }
+  if (a > b) { int t = a; a = b; b = t; }
+  return b;
 }
 
 /* ==================== 码盘计数 & 测速 ==================== */
@@ -323,8 +402,10 @@ void updateOLED() {
   // 行 2：正前距离 + 舵机指向（括号内为该方向距离）
   char dir = 'C';
   int dirVal = frontDistance;
-  if (isAuto && autoState == AUTO_SCAN_LEFT)  { dir = 'L'; dirVal = leftDistance; }
-  if (isAuto && autoState == AUTO_SCAN_RIGHT) { dir = 'R'; dirVal = rightDistance; }
+  if (isAuto && autoState == AUTO_VERIFY) {  // 扫描中：显示当前扫描方向与读数
+    dir = (scanOffset > 0) ? 'L' : ((scanOffset < 0) ? 'R' : 'C');
+    dirVal = sweepMap[(scanOffset + SWEEP_MAX_DEG + SWEEP_STEP_DEG / 2) / SWEEP_STEP_DEG];
+  }
   if (frontDistance != lastFront || dir != lastDir || dirVal != lastDirVal || isAuto != lastIsAuto) {
     char buf[22];
     snprintf(buf, sizeof(buf), "D:%dcm Servo:%c(%d)", frontDistance, dir, dirVal);  // 最长 20 字符
@@ -353,10 +434,13 @@ void updateOLED() {
   // 行 6：运动状态（定宽 7 字符，直接覆盖不残留）
   char motion;
   if (isAuto) {
-    if (autoState == AUTO_FORWARD && frontDistance > OBSTACLE_THRESHOLD) motion = 'F';
+    if (autoState == AUTO_VERIFY) motion = 'V';
+    else if (autoState == AUTO_FORWARD && frontDistance > OBSTACLE_THRESHOLD) motion = 'F';
     else if (autoState == AUTO_TURN_LEFT)  motion = 'L';
     else if (autoState == AUTO_TURN_RIGHT) motion = 'R';
     else if (autoState == AUTO_BACK_UP)    motion = 'B';
+    else if (autoState == AUTO_TURN_AROUND) motion = 'U';
+    else if (autoState == AUTO_FAULT) motion = 'X';
     else motion = 'S';
   } else {
     motion = manualBlocked ? '!' : lastManualCmd;  // '!'=前进被障碍拦停
@@ -369,6 +453,9 @@ void updateOLED() {
       case 'L': display.print("<< LFT "); break;
       case 'R': display.print("RGT >> "); break;
       case '!': display.print("BLOCK! "); break;
+      case 'V': display.print(" SCAN  "); break;
+      case 'U': display.print(" U-TURN"); break;
+      case 'X': display.print(" FAULT "); break;
       default:  display.print(" STOP  "); break;
     }
     lastMotion = motion;
@@ -378,13 +465,18 @@ void updateOLED() {
 }
 
 /* ==================== 自动避障状态机 ==================== */
-/* 流程：FORWARD(前行，50cm 内提前减速) --前方<25cm--> OBSTACLE_STOP(停车0.3s)
-        ├─ 障碍已消失 --> 直接回 FORWARD（省一轮扫描）
-        └─ 仍在 --> SCAN_LEFT --> SCAN_RIGHT（各0.3s，左右各测一次）
-              ├─ 两侧都<30cm = 死胡同 --> BACK_UP(倒车) --> 重新扫描
-              └─ 转向空旷侧 TURN_LEFT / TURN_RIGHT --> FORWARD
+/* 扫描-确认-前进 循环（先确认方向通畅再走，不再边走边扫）：
+   VERIFY  ：停车，舵机从 -75° 到 +75° 匀速连续扫一轮（每 15° 采样一次，不停顿），
+             扫完才决策 —— 正前 ±30°（车头通路）最近距离 ≥30cm 才允许前进
+    ├─ 前方通畅 --> FORWARD
+    ├─ 两侧都不足 50cm（转过去也是墙）= 死胡同 --> BACK_UP（倒完重新 VERIFY；
+    │     连续倒 3 次仍出不去则 U-TURN 掉头）
+    └─ 单侧通畅 --> TURN_LEFT / TURN_RIGHT（转完重新 VERIFY）
+   FORWARD ：只盯正前（60ms 单发+无回波补测），按确认到的距离走一段：
+             前方<25cm 或走完确认距离（单段上限 50cm/2s）→ 停车重新 VERIFY
+             50cm 降 1/3、35cm 半速；侧翼按上一轮扫描结果差速绕行
    转向/倒车时长按当前速度缩放，保持转角大致恒定；
-   卡住兜底：码盘在线且持续给油车轮不转（低矮障碍超声波看不到）→ 视同遇障重新决策 */
+   卡住兜底：码盘在线且持续给油车轮不转 → 重新 VERIFY（贴身障碍超声波常无回波） */
 
 // 自动模式统一运行速度：速度被调到 0/死区时用最低可运转速度兜底
 int runSpeed() {
@@ -397,118 +489,232 @@ unsigned long scaledMs(int baseMs) {
   return constrain(ms, 400UL, 2200UL);
 }
 
+/* ==================== 确认扫描 & 行驶测距 ==================== */
+
+// 进入确认扫描：立即停车，舵机摆到最右端，开始逐格扫描
+void startVerifySweep() {
+  carStop();
+  autoState = AUTO_VERIFY;
+  stateStartMs = millis();
+  scanPos = 0;                     // 从中位起摆，先扫右侧再一路扫到左侧
+  scanDir = -1;
+  scanReturning = false;
+  scanLastIdx = -99;
+  scanOffset = scanPos;
+  scanTickMs = millis();
+  scanFrontMin = 999;
+  scanCenterMin = 999;
+  scanLeftMin = 999;
+  scanRightMin = 999;
+  for (int i = 0; i < SWEEP_POINTS; i++) sweepMap[i] = 999;
+  writeScanServo(scanOffset);
+  Serial.println(F("[AUTO] Scan full range..."));
+}
+
+// 扫描完成：按扫描结果决定下一步（前进 / 转向 / 倒车）
+void finishVerifySweep() {
+  frontDistance = scanCenterMin;   // 前进段测的是正前方，这里保持同一口径
+  leftDistance = scanLeftMin;
+  rightDistance = scanRightMin;
+  servoCenter();
+  scanOffset = 0;
+  Serial.print(F("[AUTO] Scan done front="));
+  Serial.print(scanFrontMin);
+  Serial.print(F(" L="));
+  Serial.print(scanLeftMin);
+  Serial.print(F(" R="));
+  Serial.println(scanRightMin);
+
+  // 整幅全部 999：可能真空旷，也可能探头失效。单轮无法区分，只累计连续轮数，
+  // 等"全空 + 轮子转不动"同时出现时才判定失效（见 FORWARD 卡住分支）
+  bool allNoEcho = true;
+  for (int i = 0; i < SWEEP_POINTS; i++)
+    if (sweepMap[i] != 999) { allNoEcho = false; break; }
+  if (allNoEcho) {
+    if (noEchoScans < 250) noEchoScans++;
+  } else {
+    noEchoScans = 0;
+  }
+
+  if (scanFrontMin >= CONFIRM_CLEAR_CM) {  // 前方确认畅通，才允许前进
+    autoState = AUTO_FORWARD;
+    stateStartMs = millis();
+    stallStartMs = millis();  // 卡住检测从这里重新计时，不沿用扫描期间的时间戳
+    backUpCount = 0;  // 脱困成功，倒车计数清零
+    // 按正中方向确认到的距离定本段前进时长：走到还剩约 35cm 就停车重扫
+    int travelCm = scanCenterMin - 35;
+    if (travelCm < 10) travelCm = 10;
+    if (travelCm > 50) travelCm = 50;   // 单段最长 50cm：更频繁停车重扫，减少侧前方盲区
+    unsigned long ms = (unsigned long)travelCm * 1000UL / (unsigned long)(runSpeed() / 6);
+    forwardDeadlineMs = millis() + constrain(ms, FORWARD_MIN_MS, 2000UL);
+  } else if (scanLeftMin < DEAD_END_SIDE_CM && scanRightMin < DEAD_END_SIDE_CM) {
+    // 正前堵死，两侧也不足 50cm（转过去也是墙）= 死胡同
+    if (backUpCount >= MAX_BACKUP_TIMES) {  // 倒了几次还是出不去，不要无限倒
+      autoState = AUTO_TURN_AROUND;
+      stateStartMs = millis();
+      backUpCount = 0;
+      Serial.println(F("[AUTO] Dead end persists, U-turn"));
+    } else {
+      autoState = AUTO_BACK_UP;  // 先倒车拉开距离
+      stateStartMs = millis();
+      backUpCount++;
+      Serial.print(F("[AUTO] Dead end, backing up #"));
+      Serial.println(backUpCount);
+    }
+  } else if (scanLeftMin >= scanRightMin) {
+    autoState = AUTO_TURN_LEFT;
+    stateStartMs = millis();
+    Serial.println(F("[AUTO] Choose LEFT"));
+  } else {
+    autoState = AUTO_TURN_RIGHT;
+    stateStartMs = millis();
+    Serial.println(F("[AUTO] Choose RIGHT"));
+  }
+}
+
+// 匀速连续扫描：位置按经过时间推进，全程不停顿；测距在摆动途中按格点取样。
+// 扫描测距用 120cm 量程版本(约7.6ms)，阻塞小于一步 5ms 的推进节拍，舵机转速不被打断。
+// 扫到左端后不停下甩回中位，而是继续匀速走回 0°，再交给状态机（末段不采样）
+void updateVerifySweep(unsigned long now) {
+  if (now - scanTickMs >= MICRO_STEP_MS) {
+    unsigned long steps = (now - scanTickMs) / MICRO_STEP_MS;
+    if (steps > 10) steps = 10;   // 极端阻塞后不追补，避免瞬间甩动
+    scanTickMs += steps * MICRO_STEP_MS;
+    while (steps-- > 0) {
+      scanPos += scanDir;
+      if (scanReturning) {
+        if (scanPos <= 0) {         // 回到中位，扫描结束
+          scanPos = 0;
+          scanOffset = 0;
+          writeScanServo(0);
+          finishVerifySweep();
+          return;
+        }
+      } else if (scanPos <= -SWEEP_MAX_DEG) {
+        scanPos = -SWEEP_MAX_DEG;
+        scanDir = 1;                // 到右端折返
+      } else if (scanPos >= SWEEP_MAX_DEG) {
+        scanPos = SWEEP_MAX_DEG;
+        scanDir = -1;
+        scanReturning = true;       // 扫完左端，开始匀速回中
+      }
+    }
+  }
+
+  scanOffset = scanPos;
+  writeScanServo(scanPos);
+
+  if (scanReturning) return;       // 回中段不再采样，避免重复 ping 拖慢回流
+
+  int idx = (scanPos + SWEEP_MAX_DEG + SWEEP_STEP_DEG / 2) / SWEEP_STEP_DEG;
+  if (idx < 0) idx = 0;
+  if (idx > SWEEP_POINTS - 1) idx = SWEEP_POINTS - 1;
+  if (idx != scanLastIdx) {                       // 每跨过一个格点测一次
+    scanLastIdx = idx;
+    int d = readSonarCmFast();                    // 连续摆动中没有稳定窗口，单发取样
+    sweepMap[idx] = d;
+    if (idx == SWEEP_CENTER_IDX) scanCenterMin = d;
+    if (idx >= SWEEP_CENTER_IDX - 2 && idx <= SWEEP_CENTER_IDX + 2) {
+      // 正前 ±30° 都算"车头通路"：HC-SR04 有效锥角约 ±15°，左前/右前 20~30° 的障碍
+      // 一旦车开动就出了声波锥，必须在扫描阶段拦住
+      if (d < scanFrontMin) scanFrontMin = d;
+      frontDistance = scanFrontMin;  // 扫描中实时更新显示
+    } else if (idx < SWEEP_CENTER_IDX) {
+      if (d < scanRightMin) scanRightMin = d;
+    } else {
+      if (d < scanLeftMin) scanLeftMin = d;
+    }
+  }
+}
+
+// 行驶中只盯正前：车在动，用 120cm 量程快测(~7.6ms)，避免长时间阻塞主循环；
+// 单发 999 再补测一次，斜面偶发打空不会直接写进 frontDistance
+void updateForwardSonar(unsigned long now) {
+  if (now - lastSonarMs < FORWARD_SONAR_MS) return;
+  int d = readSonarCmFast();
+  if (d == 999) d = readSonarCmFast();
+  frontDistance = d;
+  lastSonarMs = now;
+}
+
 void runAutoStateMachine() {
   unsigned long now = millis();
 
   // 卡住检测计时：仅 FORWARD 状态累计，车轮恢复转动立刻清零
-  static unsigned long stallStartMs = 0;
   bool wheelsTurning = (leftSpeedCms > 2.0f || rightSpeedCms > 2.0f);
   if (autoState != AUTO_FORWARD || wheelsTurning || !encSeen) stallStartMs = now;
 
   switch (autoState) {
 
+    case AUTO_VERIFY:
+      // 停车扫描由 updateVerifySweep() 推进，扫完自行切到 前进/转向/倒车
+      break;
+
     case AUTO_FORWARD: {
       int spd = runSpeed();
-      if (frontDistance < APPROACH_DIST) {           // 接近减速：降 1/3，留足刹停余量
-        int slow = spd * 2 / 3;
-        if (slow < MIN_RUN_PWM + 10) slow = MIN_RUN_PWM + 10;
-        spd = slow;
+      if (frontDistance < BRAKE_ZONE_DIST) spd = spd / 2;         // 贴身：半速，减小撞击动能
+      else if (frontDistance < APPROACH_DIST) spd = spd * 2 / 3;  // 接近：降 1/3
+      if (frontDistance < APPROACH_DIST && spd < MIN_RUN_PWM + 10) spd = MIN_RUN_PWM + 10;
+      // 侧翼用上一轮扫描结果修正：单侧近就向另一侧差速绕；两侧都近=窄通道，照直走
+      if (frontDistance >= APPROACH_DIST && leftDistance < SIDE_CLEAR_MIN && rightDistance >= SIDE_CLEAR_MIN) {
+        carForwardVeer(spd, true);   // 左侧近 → 向右绕
+      } else if (frontDistance >= APPROACH_DIST && rightDistance < SIDE_CLEAR_MIN && leftDistance >= SIDE_CLEAR_MIN) {
+        carForwardVeer(spd, false);  // 右侧近 → 向左绕
+      } else {
+        carForward(spd);
       }
-      carForward(spd);
       if (encSeen && now - stallStartMs > STALL_TIME_MS) {
-        // 电机在转但车不动：顶到低矮障碍，走一遍避障决策脱困
-        autoState = AUTO_OBSTACLE_STOP;
-        stateStartMs = now;
-        Serial.println("[AUTO] Wheels stalled, re-decide");
-      } else if (frontDistance < OBSTACLE_THRESHOLD) {  // readSonarCm 失败时返回 999，不会误触发
-        autoState = AUTO_OBSTACLE_STOP;
-        stateStartMs = now;
-        Serial.print("[AUTO] Obstacle! d=");
+        if (noEchoScans >= 3) {
+          // 连续三轮扫描整幅无回波，却又顶住了走不动 → 超声波失效/被遮挡，停车报警
+          autoState = AUTO_FAULT;
+          stateStartMs = now;
+          carStop();
+          Serial.println(F("[FAULT] Sonar blind + wheels stalled, stopped. Press A to retry"));
+        } else {
+          Serial.println(F("[AUTO] Wheels stalled, re-scan"));  // 顶住障碍但超声波测不到：重扫
+          startVerifySweep();
+        }
+      } else if (frontDistance < OBSTACLE_THRESHOLD) {
+        Serial.print(F("[AUTO] Obstacle! d="));
         Serial.println(frontDistance);
+        startVerifySweep();  // 停车重新扫描确认
+      } else if (now >= forwardDeadlineMs) {
+        Serial.println(F("[AUTO] Segment done, re-scan"));  // 走完确认过的一段，重新扫
+        startVerifySweep();
       }
       break;
     }
 
-    case AUTO_OBSTACLE_STOP:
-      carStop();
-      servoCenter();
-      if (now - stateStartMs > 300) {
-        if (frontDistance >= OBSTACLE_THRESHOLD + 5) {
-          autoState = AUTO_FORWARD;  // 障碍已消失（行人走过等），直接续行
-          lastSonarMs = now - SONAR_INTERVAL;
-          Serial.println("[AUTO] Clear again, resume FWD");
-        } else {
-          autoState = AUTO_SCAN_LEFT;
-          stateStartMs = now;
-          servoLeft();
-          Serial.println("[AUTO] Scanning LEFT...");
-        }
-      }
-      break;
-
-    case AUTO_SCAN_LEFT:
-      if (now - stateStartMs > SCAN_TIME_MS) {
-        leftDistance = readSonarCm();
-        if (leftDistance == 999) leftDistance = readSonarCm();  // 近距无回波偶发假999，补测一次
-        Serial.print("[AUTO] Left: ");
-        Serial.println(leftDistance);
-        autoState = AUTO_SCAN_RIGHT;
-        stateStartMs = now;
-        servoRight();
-      }
-      break;
-
-    case AUTO_SCAN_RIGHT:
-      if (now - stateStartMs > SCAN_TIME_MS) {
-        rightDistance = readSonarCm();
-        if (rightDistance == 999) rightDistance = readSonarCm();  // 近距无回波偶发假999，补测一次
-        Serial.print("[AUTO] Right: ");
-        Serial.println(rightDistance);
-        servoCenter();
-
-        // 无回波方向距离=999（视为最空旷），>= 比较自然优先选择空侧
-        if (leftDistance < SIDE_CLEAR_MIN && rightDistance < SIDE_CLEAR_MIN) {
-          autoState = AUTO_BACK_UP;  // 两侧都堵死：倒车拉开距离再重新扫
-          stateStartMs = now;
-          Serial.println("[AUTO] Dead end, backing up");
-        } else if (leftDistance >= rightDistance) {
-          autoState = AUTO_TURN_LEFT;
-          stateStartMs = now;
-          Serial.println("[AUTO] Choose LEFT");
-        } else {
-          autoState = AUTO_TURN_RIGHT;
-          stateStartMs = now;
-          Serial.println("[AUTO] Choose RIGHT");
-        }
-      }
-      break;
-
     case AUTO_BACK_UP:
       carBackward(runSpeed());
       if (now - stateStartMs > scaledMs(BACKUP_TIME_MS)) {
-        autoState = AUTO_SCAN_LEFT;  // 倒完直接重新扫，不回 FORWARD（正前大概率仍是墙）
-        stateStartMs = now;
-        servoLeft();
-        Serial.println("[AUTO] Scanning LEFT...");
+        startVerifySweep();  // 倒完重新扫，确认无障碍再走
       }
       break;
 
     case AUTO_TURN_LEFT:
       carTurnLeft(runSpeed());
       if (now - stateStartMs > scaledMs(TURN_TIME_MS)) {
-        autoState = AUTO_FORWARD;
-        stateStartMs = now;
-        lastSonarMs = now - SONAR_INTERVAL;  // 立即重测正前方
+        startVerifySweep();  // 转完先扫描确认，再决定是否前进
       }
       break;
 
     case AUTO_TURN_RIGHT:
       carTurnRight(runSpeed());
       if (now - stateStartMs > scaledMs(TURN_TIME_MS)) {
-        autoState = AUTO_FORWARD;
-        stateStartMs = now;
-        lastSonarMs = now - SONAR_INTERVAL;  // 立即重测正前方
+        startVerifySweep();  // 转完先扫描确认，再决定是否前进
       }
+      break;
+
+    case AUTO_TURN_AROUND:  // 死胡同反复脱不了困：原地掉头 180°（时长翻倍）
+      carTurnLeft(runSpeed());
+      if (now - stateStartMs > scaledMs(TURN_TIME_MS) * 2) {
+        startVerifySweep();
+      }
+      break;
+
+    case AUTO_FAULT:  // 传感器失效：保持停车，闪灯报警；按 A 重新扫描即解除
+      carStop();
       break;
   }
 }
@@ -520,17 +726,19 @@ void switchToManual() {
   currentMode = MODE_MANUAL;
   carStop();
   servoCenter();
-  Serial.println("[MODE] -> MANUAL");
+  Serial.println(F("[MODE] -> MANUAL"));
 }
 
 void switchToAuto() {
-  if (currentMode == MODE_AUTO) return;
+  if (currentMode == MODE_AUTO) {  // 已在自动模式再按 A：重新扫描一次（相当于"重试"）
+    startVerifySweep();
+    return;
+  }
   currentMode = MODE_AUTO;
-  autoState = AUTO_FORWARD;
-  stateStartMs = millis();
-  manualBlocked = false;  // 离开手动模式，清除拦停标志
-  servoCenter();
-  Serial.println("[MODE] -> AUTO");
+  manualBlocked = false;   // 离开手动模式，清除拦停标志
+  backUpCount = 0;         // 新一次自动行驶，倒车计数从零开始
+  startVerifySweep();      // 先停车扫描，确认方向通畅后才前进
+  Serial.println(F("[MODE] -> AUTO"));
 }
 
 /* ==================== 蓝牙命令解析 ==================== */
@@ -557,9 +765,9 @@ void handleBluetooth() {
   lastCmdMs = millis();  // 每收到一个有效字符，LED 短闪反馈
   cmdSeq++;
 
-  Serial.print("[BLE] ");
+  Serial.print(F("[BLE] "));
   Serial.print(bluetoothCmd);
-  Serial.print(" -> ");
+  Serial.print(F(" -> "));
 
   switch (bluetoothCmd) {
     case 'F':
@@ -568,7 +776,7 @@ void handleBluetooth() {
       lastManualCmd = 'F';
       manualStepEndMs = millis() + MANUAL_STEP_MS;  // 点动：到时自停，重复收到则续时
       applyManualMotion();
-      Serial.println("FWD");
+      Serial.println(F("FWD"));
       break;
     case 'B':
     case 'b':
@@ -576,7 +784,7 @@ void handleBluetooth() {
       lastManualCmd = 'B';
       manualStepEndMs = millis() + MANUAL_STEP_MS;
       applyManualMotion();
-      Serial.println("BWD");
+      Serial.println(F("BWD"));
       break;
     case 'L':
     case 'l':
@@ -584,7 +792,7 @@ void handleBluetooth() {
       lastManualCmd = 'L';
       manualStepEndMs = millis() + MANUAL_STEP_MS;
       applyManualMotion();
-      Serial.println("LFT");
+      Serial.println(F("LFT"));
       break;
     case 'R':
     case 'r':
@@ -592,14 +800,14 @@ void handleBluetooth() {
       lastManualCmd = 'R';
       manualStepEndMs = millis() + MANUAL_STEP_MS;
       applyManualMotion();
-      Serial.println("RGT");
+      Serial.println(F("RGT"));
       break;
     case 'S':
     case 's':
       switchToManual();
       lastManualCmd = 'S';
       applyManualMotion();
-      Serial.println("STP");
+      Serial.println(F("STP"));
       break;
     case 'A':
     case 'a':
@@ -609,12 +817,12 @@ void handleBluetooth() {
     case 't':
       // 舵机自检：强制手动停车后左右扫一遍，判断舵机/接线是否正常
       switchToManual();
-      Serial.println("SERVO TEST: L-C-R-C");
+      Serial.println(F("SERVO TEST: L-C-R-C"));
       scanServo.write(SERVO_LEFT);   delay(600);
       scanServo.write(SERVO_CENTER); delay(600);
       scanServo.write(SERVO_RIGHT);  delay(600);
       servoCenter();
-      Serial.println("SERVO TEST done");
+      Serial.println(F("SERVO TEST done"));
       break;
     case '+':
     case 'U':
@@ -623,7 +831,7 @@ void handleBluetooth() {
       if (currentSpeed > 255) currentSpeed = 255;
       if (currentSpeed < MIN_RUN_PWM) currentSpeed = MIN_RUN_PWM;  // 从停转加速直接进入可运转区间
       if (currentMode == MODE_MANUAL) applyManualMotion();  // 立即生效
-      Serial.print("SPD+ ");
+      Serial.print(F("SPD+ "));
       Serial.println(currentSpeed);
       break;
     case '-':
@@ -632,7 +840,7 @@ void handleBluetooth() {
       currentSpeed -= SPEED_STEP;
       if (currentSpeed < MIN_RUN_PWM) currentSpeed = 0;  // 减进死区直接停，避免只哼不转
       if (currentMode == MODE_MANUAL) applyManualMotion();  // 立即生效
-      Serial.print("SPD- ");
+      Serial.print(F("SPD- "));
       Serial.println(currentSpeed);
       break;
     case '1':
@@ -649,12 +857,12 @@ void handleBluetooth() {
         currentSpeed = map(idx, 1, 9, MIN_RUN_PWM, 255);  // 1 档=最低可运转速度，避开低速死区
         if (currentSpeed > 255) currentSpeed = 255;
         if (currentMode == MODE_MANUAL) applyManualMotion();  // 立即生效
-        Serial.print("SPD ");
+        Serial.print(F("SPD "));
         Serial.println(currentSpeed);
         break;
       }
     default:
-      Serial.println("(ignored)");
+      Serial.println(F("(ignored)"));
   }
 }
 
@@ -669,7 +877,7 @@ void updateManualStep() {
   if ((long)(millis() - manualStepEndMs) < 0) return;  // 未到点动截止时刻
   lastManualCmd = 'S';
   carStop();
-  Serial.println("[MAN] Step done, stop");
+  Serial.println(F("[MAN] Step done, stop"));
 }
 
 /* ==================== 手动前向防碰撞 ==================== */
@@ -684,13 +892,13 @@ void updateManualGuard() {
   if (frontDistance < OBSTACLE_THRESHOLD) {
     if (!manualBlocked) {
       manualBlocked = true;
-      Serial.println("[GUARD] Front obstacle, auto stop");
+      Serial.println(F("[GUARD] Front obstacle, auto stop"));
     }
     carStop();  // 持续保持停车，防止被重复下发的 F 覆盖
   } else if (manualBlocked) {
     manualBlocked = false;
     applyManualMotion();  // 障碍清除，恢复前进
-    Serial.println("[GUARD] Clear, resume FWD");
+    Serial.println(F("[GUARD] Clear, resume FWD"));
   }
 }
 
@@ -707,7 +915,7 @@ void setup() {
 
   pinMode(STATUS_LED, OUTPUT);
   digitalWrite(STATUS_LED, HIGH);
-  Serial.print("[1] LED on, free RAM: ");
+  Serial.print(F("[1] LED on, free RAM: "));
   Serial.println(freeRam());
 
   // 先探测 0x3C 是否应答：OLED 未接/故障时跳过显示初始化（降级运行），
@@ -719,20 +927,20 @@ void setup() {
     display.begin(&Adafruit128x64, 0x3C);
     display.setFont(System5x7);
     Wire.setClock(400000L);  // I2C 提速到 400kHz，刷屏更快
-    Serial.println("[2] OLED begin done");
+    Serial.println(F("[2] OLED begin done"));
     display.clear();
     display.setCursor(0, 0);
     display.println("Hello World!");
-    Serial.println("[3] OLED show done");
+    Serial.println(F("[3] OLED show done"));
     delay(2000);  // 开机画面停留
   } else {
-    Serial.println("[3] OLED offline, run without display");
+    Serial.println(F("[3] OLED offline, run without display"));
   }
-  Serial.println("[4] OLED stage done");
+  Serial.println(F("[4] OLED stage done"));
 
   bluetoothSerial = new SoftwareSerial(8, 9);
   bluetoothSerial->begin(9600);
-  Serial.println("[5] BLE init done");
+  Serial.println(F("[5] BLE init done"));
 
   // 超声波引脚：Trig 推挽输出，Echo 输入（替代 NewPing 的内部配置）
   pinMode(SONAR_TRIG, OUTPUT);
@@ -763,20 +971,23 @@ void setup() {
   frontDistance = readSonarCm();
   lastSonarMs = millis();
 
-  Serial.println("=== Bluetooth Car Ready ===");
-  Serial.println("F/B/L/R/S=Manual  A=Auto  +/-=Speed  1-9=Gear");
+  Serial.println(F("=== Bluetooth Car Ready ==="));
+  Serial.println(F("F/B/L/R/S=Manual  A=Auto  +/-=Speed  1-9=Gear"));
 }
 
 void loop() {
   unsigned long now = millis();
 
-  // 舵机居中时测距才是"正前方"；扫描/转向期间跳过，
-  // 避免侧面读数污染 frontDistance，也避免与扫描测距背靠背 ping 互相干扰
-  bool servoCentered = (currentMode == MODE_MANUAL) ||
-                       (autoState == AUTO_FORWARD) ||
-                       (autoState == AUTO_OBSTACLE_STOP);
-  if (servoCentered && now - lastSonarMs >= SONAR_INTERVAL) {
-    frontDistance = readSonarCm();
+  // 确认扫描阶段由 updateVerifySweep 推进；前进阶段只盯正前；手动模式低频测距
+  if (currentMode == MODE_AUTO && autoState == AUTO_VERIFY) {
+    updateVerifySweep(now);
+  } else if (currentMode == MODE_AUTO && autoState == AUTO_FORWARD) {
+    updateForwardSonar(now);
+  } else if (currentMode == MODE_MANUAL && now - lastSonarMs >= SONAR_INTERVAL) {
+    // 手动模式优先保证蓝牙响应：先单发快测(约8ms)，只有近到需要拦停时才做中值确认
+    int d = readSonarCmFast();
+    if (d < APPROACH_DIST) d = readSonarFiltered();
+    frontDistance = d;
     lastSonarMs = now;
   }
 
